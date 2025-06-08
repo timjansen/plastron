@@ -55,4 +55,9 @@ export interface GlobalStats {
     prevSecStartMs: number;
     currentSecStartMs: number;
     negativeReqInCurrentSec: number;
+    reqInCurrentMin: number;
+    reqInPrevMin: number;
+    rateLimited429InCurrentMin: number;
+    rateLimited429InPrevMin: number;
+    currentMinStartMs: number;
 }

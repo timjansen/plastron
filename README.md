@@ -211,6 +211,42 @@ Get global statistics about the middleware's current state.
 - **Smart Eviction**: Protects VIPs and persistent abusers from being evicted
 - **Progressive Punishment**: Linear increase in penalties as scores worsen
 
+## Integration
+
+### Happy-Server Support
+
+Plastron automatically integrates with [happy-server](https://github.com/timjansen/happy-server) if it's available in your application. When happy-server is detected, Plastron will add a `plastron` property to the health endpoint that provides detailed security metrics:
+
+```typescript
+// If happy-server is installed, the /happy endpoint will include:
+{
+  // ... other health data
+  plastron: {
+    status: 'ok',
+    totalMonitoredIps: 1247,
+    positiveScoreIps: 1156,
+    negativeScoreIps: 91,
+    worstIp: {
+      ip: '192.168.1.100',
+      score: -125000
+    },
+    rateLimited429LastMinute: 23,
+    totalRequestsLastMinute: 1847,
+    globalRequestsPerSecond: 45.7
+  }
+}
+```
+
+This integration happens automatically - no configuration needed. Simply install happy-server alongside Plastron:
+
+```bash
+npm install happy-server plastron
+```
+
+**Dependency Loading**: If happy-server is not immediately available when Plastron initializes, Plastron will automatically retry the registration after 3 seconds to handle cases where dependencies are loaded in different orders.
+
+**Note**: Plastron works perfectly fine without happy-server. This integration is optional and only activates when happy-server is present.
+
 ## Testing
 
 ```bash

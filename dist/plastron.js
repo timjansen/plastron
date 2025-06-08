@@ -23,6 +23,8 @@ const defaultOptions = {
     pointsFor404: -100,
     pointsFor40x: -10,
     pointsFor50x: -20,
+    enableDebug: false,
+    logger: console.log,
     nowFn: undefined
 };
 // Global random modifier created once for all instances
@@ -60,12 +62,21 @@ function updateTimeWindows(ipData, nowMs) {
 function updateGlobalStats(globalStats, nowMs) {
     const currentSec = Math.ceil(nowMs / 1000);
     const prevSec = Math.ceil(globalStats.prevSecStartMs / 1000);
+    const currentMin = Math.ceil(nowMs / 60000);
+    const prevMin = Math.ceil(globalStats.currentMinStartMs / 60000);
     if (currentSec != prevSec) {
         globalStats.reqInPrevSec = globalStats.reqInCurrentSec;
         globalStats.reqInCurrentSec = 0;
         globalStats.negativeReqInCurrentSec = 0;
         globalStats.prevSecStartMs = globalStats.currentSecStartMs;
         globalStats.currentSecStartMs = nowMs;
+    }
+    if (currentMin != prevMin) {
+        globalStats.reqInPrevMin = globalStats.reqInCurrentMin;
+        globalStats.reqInCurrentMin = 0;
+        globalStats.rateLimited429InPrevMin = globalStats.rateLimited429InCurrentMin;
+        globalStats.rateLimited429InCurrentMin = 0;
+        globalStats.currentMinStartMs = nowMs;
     }
 }
 function calculateCurrentReqPerSec(globalStats, nowMs) {
@@ -100,13 +111,12 @@ function findEvictableIndex(monitoredIps, ipData, options, nowMs) {
     // Fallback - just return a random index
     return Math.floor(Math.random() * size);
 }
-function addIpToMonitoring(ip, monitoredIps, ipData, options, nowMs) {
-    const evictIndex = findEvictableIndex(monitoredIps, ipData, options, nowMs);
+function addIpToMonitoring(ip, monitoredIps, ipData, opts, nowMs) {
+    const evictIndex = findEvictableIndex(monitoredIps, ipData, opts, nowMs);
     // Remove old IP if exists
     const oldIp = monitoredIps[evictIndex];
-    if (oldIp) {
+    if (oldIp)
         ipData.delete(oldIp);
-    }
     // Add new IP
     const newIpData = {
         ip,
@@ -121,12 +131,13 @@ function addIpToMonitoring(ip, monitoredIps, ipData, options, nowMs) {
     };
     monitoredIps[evictIndex] = ip;
     ipData.set(ip, newIpData);
+    if (opts.enableDebug && opts.logger)
+        opts.logger(`New IP added to monitoring: ${ip}`);
     return newIpData;
 }
 function calculateSlowdown(points, options) {
-    if (points >= options.ipSlowDownStartsAt) {
+    if (points >= options.ipSlowDownStartsAt)
         return 0;
-    }
     const range = options.ipSlowDownStartsAt - options.ipSlowDownMaxPunishmentAt;
     const position = Math.max(0, options.ipSlowDownStartsAt - points);
     const ratio = Math.min(1, position / range);
@@ -168,73 +179,94 @@ function checkExcessiveUsage(ipData, options) {
         penalty += options.pointsForExcessiveRequest;
     return penalty;
 }
+function createRateLimitResponse(res, opts, ip, globalStats, reason) {
+    const payload = { error: opts.rateLimitMessage };
+    if (opts.enableDebug && reason) {
+        payload.reason = reason;
+    }
+    // Track 429 responses for happy-server metrics
+    globalStats.rateLimited429InCurrentMin++;
+    if (opts.logger)
+        opts.logger(`Request blocked (429) - IP: ${ip}, Reason: ${reason || 'Rate limit exceeded'}`);
+    return res.status(429).json(payload);
+}
 function createPlastron(userOptions) {
     if (!userOptions.rateLimitMessage)
         throw new Error('rateLimitMessage is required in PlastronOptions');
-    const options = {
+    const opts = {
         ...defaultOptions,
         ...userOptions,
         nowFn: userOptions.nowFn || createNowFunction()
     };
     // Internal state
-    const monitoredIps = new Array(options.ipMonitorSize).fill(undefined);
+    const monitoredIps = new Array(opts.ipMonitorSize).fill(undefined);
     const ipData = new Map();
     const globalStats = {
         reqInCurrentSec: 0,
         reqInPrevSec: 0,
-        prevSecStartMs: options.nowFn(),
-        currentSecStartMs: options.nowFn(),
-        negativeReqInCurrentSec: 0
+        prevSecStartMs: opts.nowFn(),
+        currentSecStartMs: opts.nowFn(),
+        negativeReqInCurrentSec: 0,
+        reqInCurrentMin: 0,
+        reqInPrevMin: 0,
+        rateLimited429InCurrentMin: 0,
+        rateLimited429InPrevMin: 0,
+        currentMinStartMs: opts.nowFn()
     };
     const middleware = (req, res, next) => {
-        const nowMs = options.nowFn();
+        const nowMs = opts.nowFn();
         const ip = getClientIp(req);
         // Update global stats
         updateGlobalStats(globalStats, nowMs);
         // Get or create IP data
-        let ipDataEntry = ipData.get(ip);
-        if (!ipDataEntry)
-            ipDataEntry = addIpToMonitoring(ip, monitoredIps, ipData, options, nowMs);
+        let ipEntry = ipData.get(ip);
+        if (!ipEntry)
+            ipEntry = addIpToMonitoring(ip, monitoredIps, ipData, opts, nowMs);
         // Update IP time windows
-        updateTimeWindows(ipDataEntry, nowMs);
-        ipDataEntry.lastSeenMs = nowMs;
+        updateTimeWindows(ipEntry, nowMs);
+        ipEntry.lastSeenMs = nowMs;
         // Check global rate limits
-        const currentGlobalReqPerSec = calculateCurrentReqPerSec(globalStats, nowMs);
-        if (options.maxRequestRatePerSec > 0 && currentGlobalReqPerSec >= options.maxRequestRatePerSec)
-            return res.status(429).json({ error: options.rateLimitMessage });
-        if (options.maxRequestNegativeIPperSec > 0 &&
-            ipDataEntry.points < 0 &&
-            globalStats.negativeReqInCurrentSec >= options.maxRequestNegativeIPperSec)
-            return res.status(429).json({ error: options.rateLimitMessage });
+        const globalReqPerSec = calculateCurrentReqPerSec(globalStats, nowMs);
+        if (opts.maxRequestRatePerSec > 0 && globalReqPerSec >= opts.maxRequestRatePerSec)
+            return createRateLimitResponse(res, opts, ip, globalStats, `Global rate limit exceeded: ${globalReqPerSec.toFixed(2)} req/sec`);
+        if (opts.maxRequestNegativeIPperSec > 0 &&
+            ipEntry.points < 0 &&
+            globalStats.negativeReqInCurrentSec >= opts.maxRequestNegativeIPperSec)
+            return createRateLimitResponse(res, opts, ip, globalStats, `Global negative IP rate limit exceeded: ${globalStats.negativeReqInCurrentSec} req/sec`);
         // Check IP-specific rate limits
-        const reqPer10Sec = calculate10SecReqPerSec(ipDataEntry);
-        const maxReqPerSec = ipDataEntry.points >= 0 ? options.maxReqPerSecPerIP : options.maxReqNegativePerSecPerIP;
+        const reqPer10Sec = calculate10SecReqPerSec(ipEntry);
+        const maxReqPerSec = ipEntry.points >= 0 ? opts.maxReqPerSecPerIP : opts.maxReqNegativePerSecPerIP;
         if (reqPer10Sec >= maxReqPerSec)
-            return res.status(429).json({ error: options.rateLimitMessage });
+            return createRateLimitResponse(res, opts, ip, globalStats, `IP rate limit exceeded: ${reqPer10Sec.toFixed(2)} req/sec (limit: ${maxReqPerSec})`);
         // Check connection limits
-        const maxConnections = calculateMaxConnections(ipDataEntry.points, options);
-        if (ipDataEntry.connections >= maxConnections)
-            return res.status(429).json({ error: options.rateLimitMessage });
+        const maxConns = calculateMaxConnections(ipEntry.points, opts);
+        if (ipEntry.connections >= maxConns)
+            return createRateLimitResponse(res, opts, ip, globalStats, `Connection limit exceeded: ${ipEntry.connections} connections (limit: ${maxConns})`);
         // Calculate slowdown
-        const slowdownMs = calculateSlowdown(ipDataEntry.points, options);
+        const slowdownMs = calculateSlowdown(ipEntry.points, opts);
         // Increment counters
         globalStats.reqInCurrentSec++;
-        if (ipDataEntry.points < 0)
+        globalStats.reqInCurrentMin++;
+        if (ipEntry.points < 0)
             globalStats.negativeReqInCurrentSec++;
-        ipDataEntry.reqInCurrentMin++;
-        ipDataEntry.reqInCurrent10Sec++;
-        ipDataEntry.connections++;
+        ipEntry.reqInCurrentMin++;
+        ipEntry.reqInCurrent10Sec++;
+        ipEntry.connections++;
         // Apply slowdown if needed
         const processRequest = () => {
             // Set up response handler to update points based on status code
-            const originalSend = res.send;
+            const origSend = res.send;
             res.send = function (body) {
                 const statusCode = res.statusCode;
-                const points = calculatePoints(statusCode, options);
-                const excessivePenalty = checkExcessiveUsage(ipDataEntry, options);
-                ipDataEntry.points += points + excessivePenalty;
-                ipDataEntry.connections = Math.max(0, ipDataEntry.connections - 1);
-                return originalSend.call(this, body);
+                const pts = calculatePoints(statusCode, opts);
+                const excessivePenalty = checkExcessiveUsage(ipEntry, opts);
+                const wasPositive = ipEntry.points >= 0;
+                ipEntry.points += pts + excessivePenalty;
+                ipEntry.connections = Math.max(0, ipEntry.connections - 1);
+                // Log if IP goes negative
+                if (opts.enableDebug && opts.logger && wasPositive && ipEntry.points < 0)
+                    opts.logger(`IP went negative: ${ip}, points: ${ipEntry.points}`);
+                return origSend.call(this, body);
             };
             next();
         };
@@ -243,11 +275,18 @@ function createPlastron(userOptions) {
         else
             processRequest();
     };
-    const addPointsToIp = (ipOrReq, points) => {
-        const ip = typeof ipOrReq === 'string' ? ipOrReq : getClientIp(ipOrReq);
+    const addPointsToIp = (ipOrReq, pts) => {
+        const ip = typeof ipOrReq == 'string' ? ipOrReq : getClientIp(ipOrReq);
         const data = ipData.get(ip);
         if (data) {
-            data.points += points;
+            const oldPts = data.points;
+            const wasPositive = oldPts >= 0;
+            data.points += pts;
+            if (opts.enableDebug && opts.logger) {
+                opts.logger(`addPointsToIp called - IP: ${ip}, added: ${pts}, total: ${data.points}`);
+                if (wasPositive && data.points < 0)
+                    opts.logger(`IP went negative: ${ip}, points: ${data.points}`);
+            }
             return true;
         }
         return false;
@@ -259,6 +298,48 @@ function createPlastron(userOptions) {
         totalMonitoredIps: ipData.size,
         globalStats: { ...globalStats }
     });
+    // Add happy-server extension if available
+    const registerHappyServerExtension = () => {
+        if (typeof globalThis.happyServerExtension == 'object') {
+            globalThis.happyServerExtension['plastron'] = () => {
+                const nowMs = opts.nowFn();
+                let positiveIps = 0;
+                let negativeIps = 0;
+                let worstIp;
+                // Analyze all monitored IPs
+                for (const [ip, data] of ipData) {
+                    if (data.points >= 0) {
+                        positiveIps++;
+                    }
+                    else {
+                        negativeIps++;
+                        if (!worstIp || data.points < worstIp.score) {
+                            worstIp = { ip, score: data.points };
+                        }
+                    }
+                }
+                // Calculate current 429 rate in the minute  
+                const totalRateLimited = globalStats.rateLimited429InCurrentMin + globalStats.rateLimited429InPrevMin;
+                const totalRequestsLastMinute = globalStats.reqInCurrentMin + globalStats.reqInPrevMin;
+                return {
+                    status: 'ok',
+                    totalMonitoredIps: ipData.size,
+                    positiveScoreIps: positiveIps,
+                    negativeScoreIps: negativeIps,
+                    worstIp: worstIp || undefined,
+                    rateLimited429LastMinute: totalRateLimited,
+                    totalRequestsLastMinute: totalRequestsLastMinute,
+                    globalRequestsPerSecond: calculateCurrentReqPerSec(globalStats, nowMs)
+                };
+            };
+            return true;
+        }
+        return false;
+    };
+    // Try to register immediately, if not available retry after 3 seconds
+    if (!registerHappyServerExtension()) {
+        setTimeout(() => registerHappyServerExtension(), 3000);
+    }
     return {
         middleware,
         addPointsToIp,

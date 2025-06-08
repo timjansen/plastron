@@ -69,6 +69,8 @@ function updateTimeWindows(ipData: IpData, nowMs: number): void {
 function updateGlobalStats(globalStats: GlobalStats, nowMs: number): void {
     const currentSec = Math.ceil(nowMs / 1000);
     const prevSec = Math.ceil(globalStats.prevSecStartMs / 1000);
+    const currentMin = Math.ceil(nowMs / 60000);
+    const prevMin = Math.ceil(globalStats.currentMinStartMs / 60000);
 
     if (currentSec != prevSec) {
         globalStats.reqInPrevSec = globalStats.reqInCurrentSec;
@@ -76,6 +78,14 @@ function updateGlobalStats(globalStats: GlobalStats, nowMs: number): void {
         globalStats.negativeReqInCurrentSec = 0;
         globalStats.prevSecStartMs = globalStats.currentSecStartMs;
         globalStats.currentSecStartMs = nowMs;
+    }
+
+    if (currentMin != prevMin) {
+        globalStats.reqInPrevMin = globalStats.reqInCurrentMin;
+        globalStats.reqInCurrentMin = 0;
+        globalStats.rateLimited429InPrevMin = globalStats.rateLimited429InCurrentMin;
+        globalStats.rateLimited429InCurrentMin = 0;
+        globalStats.currentMinStartMs = nowMs;
     }
 }
 
@@ -207,11 +217,14 @@ export interface PlastronInstance {
     getStats: () => { totalMonitoredIps: number; globalStats: GlobalStats };
 }
 
-function createRateLimitResponse(res: Response, opts: Required<PlastronOptions>, ip: string, reason?: string) {
+function createRateLimitResponse(res: Response, opts: Required<PlastronOptions>, ip: string, globalStats: GlobalStats, reason?: string) {
     const payload = { error: opts.rateLimitMessage };
     if (opts.enableDebug && reason) {
         (payload as any).reason = reason;
     }
+    
+    // Track 429 responses for happy-server metrics
+    globalStats.rateLimited429InCurrentMin++;
     
     if (opts.logger)
         opts.logger(`Request blocked (429) - IP: ${ip}, Reason: ${reason || 'Rate limit exceeded'}`);
@@ -237,7 +250,12 @@ export function createPlastron(userOptions: PlastronOptions): PlastronInstance {
         reqInPrevSec: 0,
         prevSecStartMs: opts.nowFn(),
         currentSecStartMs: opts.nowFn(),
-        negativeReqInCurrentSec: 0
+        negativeReqInCurrentSec: 0,
+        reqInCurrentMin: 0,
+        reqInPrevMin: 0,
+        rateLimited429InCurrentMin: 0,
+        rateLimited429InPrevMin: 0,
+        currentMinStartMs: opts.nowFn()
     };
 
     const middleware = (req: Request, res: Response, next: NextFunction) => {
@@ -260,30 +278,31 @@ export function createPlastron(userOptions: PlastronOptions): PlastronInstance {
         const globalReqPerSec = calculateCurrentReqPerSec(globalStats, nowMs);
         
         if (opts.maxRequestRatePerSec > 0 && globalReqPerSec >= opts.maxRequestRatePerSec)
-            return createRateLimitResponse(res, opts, ip, `Global rate limit exceeded: ${globalReqPerSec.toFixed(2)} req/sec`);
+            return createRateLimitResponse(res, opts, ip, globalStats, `Global rate limit exceeded: ${globalReqPerSec.toFixed(2)} req/sec`);
         
         if (opts.maxRequestNegativeIPperSec > 0 && 
             ipEntry.points < 0 && 
             globalStats.negativeReqInCurrentSec >= opts.maxRequestNegativeIPperSec)
-            return createRateLimitResponse(res, opts, ip, `Global negative IP rate limit exceeded: ${globalStats.negativeReqInCurrentSec} req/sec`);
+            return createRateLimitResponse(res, opts, ip, globalStats, `Global negative IP rate limit exceeded: ${globalStats.negativeReqInCurrentSec} req/sec`);
         
         // Check IP-specific rate limits
         const reqPer10Sec = calculate10SecReqPerSec(ipEntry);
         const maxReqPerSec = ipEntry.points >= 0 ? opts.maxReqPerSecPerIP : opts.maxReqNegativePerSecPerIP;
         
         if (reqPer10Sec >= maxReqPerSec)
-            return createRateLimitResponse(res, opts, ip, `IP rate limit exceeded: ${reqPer10Sec.toFixed(2)} req/sec (limit: ${maxReqPerSec})`);
+            return createRateLimitResponse(res, opts, ip, globalStats, `IP rate limit exceeded: ${reqPer10Sec.toFixed(2)} req/sec (limit: ${maxReqPerSec})`);
         
         // Check connection limits
         const maxConns = calculateMaxConnections(ipEntry.points, opts);
         if (ipEntry.connections >= maxConns)
-            return createRateLimitResponse(res, opts, ip, `Connection limit exceeded: ${ipEntry.connections} connections (limit: ${maxConns})`);
+            return createRateLimitResponse(res, opts, ip, globalStats, `Connection limit exceeded: ${ipEntry.connections} connections (limit: ${maxConns})`);
         
         // Calculate slowdown
         const slowdownMs = calculateSlowdown(ipEntry.points, opts);
         
         // Increment counters
         globalStats.reqInCurrentSec++;
+        globalStats.reqInCurrentMin++;
         if (ipEntry.points < 0) 
             globalStats.negativeReqInCurrentSec++;
         ipEntry.reqInCurrentMin++;
@@ -346,6 +365,52 @@ export function createPlastron(userOptions: PlastronOptions): PlastronInstance {
         totalMonitoredIps: ipData.size,
         globalStats: { ...globalStats }
     });
+
+    // Add happy-server extension if available
+    const registerHappyServerExtension = () => {
+        if (typeof (globalThis as any).happyServerExtension == 'object') {
+            (globalThis as any).happyServerExtension['plastron'] = () => {
+                const nowMs = opts.nowFn();
+                let positiveIps = 0;
+                let negativeIps = 0;
+                let worstIp: { ip: string; score: number } | undefined;
+
+                // Analyze all monitored IPs
+                for (const [ip, data] of ipData) {
+                    if (data.points >= 0) {
+                        positiveIps++;
+                    } else {
+                        negativeIps++;
+                        if (!worstIp || data.points < worstIp.score) {
+                            worstIp = { ip, score: data.points };
+                        }
+                    }
+                }
+
+                // Calculate current 429 rate in the minute  
+                const totalRateLimited = globalStats.rateLimited429InCurrentMin + globalStats.rateLimited429InPrevMin;
+                const totalRequestsLastMinute = globalStats.reqInCurrentMin + globalStats.reqInPrevMin;
+
+                return {
+                    status: 'ok',
+                    totalMonitoredIps: ipData.size,
+                    positiveScoreIps: positiveIps,
+                    negativeScoreIps: negativeIps,
+                    worstIp: worstIp || undefined,
+                    rateLimited429LastMinute: totalRateLimited,
+                    totalRequestsLastMinute: totalRequestsLastMinute,
+                    globalRequestsPerSecond: calculateCurrentReqPerSec(globalStats, nowMs)
+                };
+            };
+            return true;
+        }
+        return false;
+    };
+
+    // Try to register immediately, if not available retry after 3 seconds
+    if (!registerHappyServerExtension()) {
+        setTimeout(() => registerHappyServerExtension(), 3000);
+    }
 
     return {
         middleware,
