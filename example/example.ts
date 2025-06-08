@@ -20,7 +20,7 @@ const plastronInstance = createPlastron({
     maxSimultanousConnectionsNegativePerIP: 5,  // 5 connections for negative IPs
     
     // Per-IP rate limits (10-second window)
-    maxReqPerSecPerIP: 30,           // 30 req/s for positive IPs
+    maxReqPerSecPerIP: 10,           // 10 req/s for positive IPs
     maxReqNegativePerSecPerIP: 5,    // 5 req/s for negative IPs
     
     // Slowdown configuration
@@ -40,7 +40,9 @@ const plastronInstance = createPlastron({
     pointsFor401: -50000, // Very heavy penalty for unauthorized
     pointsFor404: -5000,  // Moderate penalty for not found
     pointsFor40x: -1000,  // Penalty for other client errors
-    pointsFor50x: -500    // Smaller penalty for server errors (not client's fault)
+    pointsFor50x: -500,   // Smaller penalty for server errors (not client's fault)
+
+    enableDebug: true,    // Enable debug logging
 });
 
 // Apply Plastron middleware globally

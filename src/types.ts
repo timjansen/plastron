@@ -1,4 +1,3 @@
-
 export interface IpData {
     ip: string;
     index: number; // index in monitoredIps
@@ -46,6 +45,8 @@ export interface PlastronOptions {
     pointsFor50x?: number; // points/penalty for other 50x response. Default: -20
 
     nowFn?: ()=>number;    // override for the default date function (function now(){ return Date.now() + randomModifier;}), for unit testing
+    enableDebug?: boolean; // enable debug logging. Default: false.
+    logger?: (msg: string) => void; // logger function for events. Default: undefined.
 }
 
 export interface GlobalStats {
